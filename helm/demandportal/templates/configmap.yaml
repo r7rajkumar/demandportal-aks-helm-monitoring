@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demandportal-config
+  namespace: {{ .Values.namespace }}
+data:
+  ENVIRONMENT: {{ .Values.environment | quote }}
+  LOG_LEVEL: "INFO"
+  POSTGRES_DB: {{ .Values.postgres.database | quote }}
+  POSTGRES_HOST: "{{ .Values.postgres.name }}-svc"
+  POSTGRES_PORT: {{ .Values.postgres.port | quote }}
+  ALLOWED_ORIGINS: "*"

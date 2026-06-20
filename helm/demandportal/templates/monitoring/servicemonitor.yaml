@@ -1,0 +1,129 @@
+{{- if .Values.monitoring.enabled }}
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+---
+# ServiceMonitor - tells Prometheus to scrape backend /metrics
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: demandportal-backend-monitor
+  namespace: {{ .Values.monitoring.namespace }}
+  labels:
+    app: demandportal-backend
+    release: kube-prometheus-stack    # Must match Prometheus operator label selector
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Values.backend.name }}
+  namespaceSelector:
+    matchNames:
+    - {{ .Values.namespace }}
+  endpoints:
+  - port: http
+    path: {{ .Values.monitoring.serviceMonitor.path }}
+    interval: {{ .Values.monitoring.serviceMonitor.interval }}
+    scrapeTimeout: 10s
+{{- end }}
+{{- if .Values.monitoring.alerting.enabled }}
+---
+# PrometheusRule - alerting rules for DemandPortal
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: demandportal-alerts
+  namespace: {{ .Values.monitoring.namespace }}
+  labels:
+    app: demandportal
+    release: kube-prometheus-stack
+spec:
+  groups:
+  - name: demandportal.backend
+    interval: 30s
+    rules:
+    # Alert if backend is down
+    - alert: DemandPortalBackendDown
+      expr: up{job="demandportal-backend"} == 0
+      for: 1m
+      labels:
+        severity: critical
+        app: demandportal
+      annotations:
+        summary: "DemandPortal backend is down"
+        description: "Backend pod has been down for more than 1 minute"
+
+    # Alert if high error rate
+    - alert: DemandPortalHighErrorRate
+      expr: |
+        rate(http_requests_total{job="demandportal-backend", status=~"5.."}[5m]) /
+        rate(http_requests_total{job="demandportal-backend"}[5m]) > 0.1
+      for: 5m
+      labels:
+        severity: warning
+        app: demandportal
+      annotations:
+        summary: "High error rate on DemandPortal backend"
+        description: "Error rate is above 10% for the last 5 minutes"
+
+    # Alert if high response time
+    - alert: DemandPortalHighLatency
+      expr: |
+        histogram_quantile(0.95,
+          rate(http_request_duration_seconds_bucket{job="demandportal-backend"}[5m])
+        ) > 2
+      for: 5m
+      labels:
+        severity: warning
+        app: demandportal
+      annotations:
+        summary: "High latency on DemandPortal backend"
+        description: "95th percentile latency is above 2 seconds"
+
+  - name: demandportal.pods
+    rules:
+    # Alert if pod restarts too much
+    - alert: DemandPortalPodRestartingTooMuch
+      expr: |
+        rate(kube_pod_container_status_restarts_total{
+          namespace="{{ .Values.namespace }}"
+        }[15m]) * 60 * 15 > 3
+      for: 0m
+      labels:
+        severity: warning
+        app: demandportal
+      annotations:
+        summary: "Pod restarting too frequently"
+        description: "Pod {{ "{{" }} $labels.pod {{ "}}" }} restarted more than 3 times in 15 minutes"
+
+    # Alert if HPA at max replicas
+    - alert: DemandPortalHPAMaxReplicas
+      expr: |
+        kube_horizontalpodautoscaler_status_current_replicas{
+          namespace="{{ .Values.namespace }}"
+        } == kube_horizontalpodautoscaler_spec_max_replicas{
+          namespace="{{ .Values.namespace }}"
+        }
+      for: 10m
+      labels:
+        severity: warning
+        app: demandportal
+      annotations:
+        summary: "HPA at maximum replicas"
+        description: "HPA {{ "{{" }} $labels.horizontalpodautoscaler {{ "}}" }} has been at max replicas for 10 minutes"
+
+  - name: demandportal.postgres
+    rules:
+    # Alert if postgres is down
+    - alert: DemandPortalPostgresDown
+      expr: |
+        kube_pod_status_ready{
+          namespace="{{ .Values.namespace }}",
+          pod=~"postgres.*"
+        } == 0
+      for: 1m
+      labels:
+        severity: critical
+        app: demandportal
+      annotations:
+        summary: "DemandPortal PostgreSQL is down"
+        description: "PostgreSQL pod is not ready"
+{{- end }}
+{{- end }}

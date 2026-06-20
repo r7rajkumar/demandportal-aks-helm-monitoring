@@ -1,0 +1,37 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: demandportal-backend-sa
+  namespace: {{ .Values.namespace }}
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: demandportal-deployer-role
+  namespace: {{ .Values.namespace }}
+rules:
+- apiGroups: ["apps"]
+  resources: ["deployments"]
+  verbs: ["get", "list", "update", "patch"]
+- apiGroups: [""]
+  resources: ["pods", "services", "configmaps"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["pods/log"]
+  verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: demandportal-deployer-binding
+  namespace: {{ .Values.namespace }}
+subjects:
+- kind: ServiceAccount
+  name: demandportal-backend-sa
+  namespace: {{ .Values.namespace }}
+roleRef:
+  kind: Role
+  name: demandportal-deployer-role
+  apiGroup: rbac.authorization.k8s.io

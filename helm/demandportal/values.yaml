@@ -1,0 +1,174 @@
+# ─────────────────────────────────────────────
+# Global
+# ─────────────────────────────────────────────
+namespace: demandportal
+environment: production
+
+# ─────────────────────────────────────────────
+# Image Registry
+# Set via --set image.registry=<acr-login-server> in CI/CD
+# ─────────────────────────────────────────────
+image:
+  registry: ""
+  pullPolicy: Always
+
+# ─────────────────────────────────────────────
+# Backend (FastAPI)
+# ─────────────────────────────────────────────
+backend:
+  name: demandportal-backend
+  replicaCount: 2
+  image:
+    repository: demandportal/backend
+    tag: latest
+  port: 8000
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "128Mi"
+    limits:
+      cpu: "500m"
+      memory: "256Mi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  probes:
+    liveness:
+      initialDelaySeconds: 60
+      periodSeconds: 15
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      initialDelaySeconds: 30
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+    startup:
+      failureThreshold: 60
+      periodSeconds: 10
+
+# ─────────────────────────────────────────────
+# Frontend (React + Nginx)
+# ─────────────────────────────────────────────
+frontend:
+  name: demandportal-frontend
+  replicaCount: 2
+  image:
+    repository: demandportal/frontend
+    tag: latest
+  port: 80
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "64Mi"
+    limits:
+      cpu: "200m"
+      memory: "128Mi"
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+
+# ─────────────────────────────────────────────
+# PostgreSQL (in-cluster)
+# ─────────────────────────────────────────────
+postgres:
+  name: postgres
+  image: postgres:15-alpine
+  port: 5432
+  database: demandportal
+  user: demandportal_user
+  storage: "10Gi"
+  storageClass: "managed-csi"   # Azure managed disk
+  resources:
+    requests:
+      cpu: "250m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"
+
+# ─────────────────────────────────────────────
+# Secrets
+# Passed via --set at deploy time from GitHub secrets
+# ─────────────────────────────────────────────
+secrets:
+  postgresPassword: ""
+  appSecretKey: ""
+
+# ─────────────────────────────────────────────
+# Ingress
+# ─────────────────────────────────────────────
+ingress:
+  enabled: true
+  className: nginx
+  host: ""    # Set via --set ingress.host= or leave blank for IP access
+  tls:
+    enabled: false
+    secretName: demandportal-tls
+    clusterIssuer: letsencrypt-prod
+  annotations:
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/limit-rps: "20"
+
+# ─────────────────────────────────────────────
+# cert-manager
+# ─────────────────────────────────────────────
+certManager:
+  email: "your-email@example.com"
+
+# ─────────────────────────────────────────────
+# Network Policy
+# ─────────────────────────────────────────────
+networkPolicy:
+  enabled: true
+
+# ─────────────────────────────────────────────
+# Resource Quota
+# ─────────────────────────────────────────────
+resourceQuota:
+  enabled: true
+  requests:
+    cpu: "4"
+    memory: "4Gi"
+  limits:
+    cpu: "8"
+    memory: "8Gi"
+  pods: "20"
+
+# ─────────────────────────────────────────────
+# Monitoring — Prometheus + Grafana
+# Installed via kube-prometheus-stack Helm chart
+# ─────────────────────────────────────────────
+monitoring:
+  enabled: true
+  namespace: monitoring
+
+  prometheus:
+    retention: 15d
+    storageSize: 20Gi
+    storageClass: managed-csi
+
+  grafana:
+    adminPassword: ""    # Set via --set monitoring.grafana.adminPassword=
+    storageSize: 5Gi
+    storageClass: managed-csi
+    # Dashboards auto-provisioned from configmaps
+    dashboards:
+      demandportal: true
+
+  # ServiceMonitor - scrape backend /metrics
+  serviceMonitor:
+    enabled: true
+    interval: 30s
+    path: /metrics
+
+  # Alerting rules
+  alerting:
+    enabled: true

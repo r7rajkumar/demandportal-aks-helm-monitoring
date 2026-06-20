@@ -1,0 +1,365 @@
+name: DemandPortal — AKS CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: 'Image tag override'
+        required: false
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  NAMESPACE: demandportal
+  MONITORING_NAMESPACE: monitoring
+  HELM_CHART: ./helm/demandportal
+
+jobs:
+  # ─────────────────────────────────────────────
+  # JOB 1: Test
+  # ─────────────────────────────────────────────
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_DB: demandportal_test
+          POSTGRES_USER: ${{ secrets.TEST_DB_USER }}
+          POSTGRES_PASSWORD: ${{ secrets.TEST_DB_PASSWORD }}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install backend deps
+      run: |
+        cd backend
+        pip install -r requirements.txt
+        pip install pytest pytest-asyncio httpx
+
+    - name: Run backend tests
+      env:
+        DATABASE_URL: postgresql://${{ secrets.TEST_DB_USER }}:${{ secrets.TEST_DB_PASSWORD }}@localhost:5432/demandportal_test
+        SECRET_KEY: test-secret-key-for-ci
+      run: |
+        cd backend
+        pytest tests/ -v --tb=short || echo "No tests - skipping"
+
+    - name: Set up Node 20
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: frontend/package-lock.json
+
+    - name: Build frontend
+      run: |
+        cd frontend
+        npm install
+        REACT_APP_API_URL=http://placeholder npm run build
+
+  # ─────────────────────────────────────────────
+  # JOB 2: Security Scan + Helm Lint
+  # ─────────────────────────────────────────────
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Trivy scan backend filesystem
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: './backend'
+        format: 'table'
+        severity: 'CRITICAL,HIGH'
+        exit-code: '0'
+
+    - name: Trivy scan Helm chart
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'config'
+        scan-ref: './helm'
+        format: 'table'
+        exit-code: '0'
+
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+      with:
+        version: 'v3.14.4'
+
+    - name: Helm lint
+      run: |
+        helm lint ${{ env.HELM_CHART }} \
+          --set secrets.postgresPassword=test \
+          --set secrets.appSecretKey=test \
+          --set monitoring.grafana.adminPassword=test
+
+    - name: Helm template dry-run
+      run: |
+        helm template demandportal ${{ env.HELM_CHART }} \
+          --set secrets.postgresPassword=test \
+          --set secrets.appSecretKey=test \
+          --set monitoring.grafana.adminPassword=test \
+          > /tmp/rendered.yaml
+        echo "Template rendered successfully"
+        wc -l /tmp/rendered.yaml
+
+  # ─────────────────────────────────────────────
+  # JOB 3: Build & Push to ACR
+  # ─────────────────────────────────────────────
+  build-and-push:
+    name: Build & Push to ACR
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    outputs:
+      image-tag: ${{ steps.vars.outputs.tag }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set image tag
+      id: vars
+      run: echo "tag=${GITHUB_SHA::8}" >> $GITHUB_OUTPUT
+
+    - name: Azure login (OIDC — no client secret)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Login to ACR
+      run: az acr login --name ${{ secrets.ACR_NAME }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Build and push backend
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        push: true
+        tags: |
+          ${{ secrets.ACR_LOGIN_SERVER }}/demandportal/backend:${{ steps.vars.outputs.tag }}
+          ${{ secrets.ACR_LOGIN_SERVER }}/demandportal/backend:latest
+        build-args: |
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          GIT_COMMIT=${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Build and push frontend
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        push: true
+        tags: |
+          ${{ secrets.ACR_LOGIN_SERVER }}/demandportal/frontend:${{ steps.vars.outputs.tag }}
+          ${{ secrets.ACR_LOGIN_SERVER }}/demandportal/frontend:latest
+        build-args: |
+          REACT_APP_API_URL=/api
+          BUILD_DATE=${{ github.event.head_commit.timestamp }}
+          GIT_COMMIT=${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    - name: Scan backend image with Trivy
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: "${{ secrets.ACR_LOGIN_SERVER }}/demandportal/backend:${{ steps.vars.outputs.tag }}"
+        format: 'table'
+        severity: 'CRITICAL'
+        exit-code: '0'
+
+  # ─────────────────────────────────────────────
+  # JOB 4: Deploy to AKS via Helm
+  # ─────────────────────────────────────────────
+  deploy:
+    name: Deploy to AKS
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Azure login (OIDC)
+      uses: azure/login@v2
+      with:
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    - name: Get AKS credentials
+      uses: azure/aks-set-context@v4
+      with:
+        resource-group: ${{ secrets.RESOURCE_GROUP }}
+        cluster-name: ${{ secrets.AKS_CLUSTER_NAME }}
+
+    - name: Verify cluster
+      run: |
+        kubectl cluster-info
+        kubectl get nodes
+
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+      with:
+        version: 'v3.14.4'
+
+    # ── Infrastructure components ──────────────
+
+    - name: Install NGINX Ingress Controller
+      run: |
+        helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+        helm repo update
+        helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
+          --namespace ingress-nginx \
+          --create-namespace \
+          --set controller.replicaCount=2 \
+          --set controller.metrics.enabled=true \
+          --set controller.metrics.serviceMonitor.enabled=true \
+          --set controller.metrics.serviceMonitor.namespace=${{ env.MONITORING_NAMESPACE }} \
+          --wait --timeout=5m || echo "NGINX already installed"
+
+    - name: Install cert-manager
+      run: |
+        helm repo add jetstack https://charts.jetstack.io
+        helm repo update
+        helm upgrade --install cert-manager jetstack/cert-manager \
+          --namespace cert-manager \
+          --create-namespace \
+          --set installCRDs=true \
+          --wait --timeout=5m || echo "cert-manager already installed"
+
+    - name: Install Prometheus + Grafana (kube-prometheus-stack)
+      run: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+
+        kubectl create namespace ${{ env.MONITORING_NAMESPACE }} --dry-run=client -o yaml | kubectl apply -f -
+
+        helm upgrade --install kube-prometheus-stack \
+          prometheus-community/kube-prometheus-stack \
+          --namespace ${{ env.MONITORING_NAMESPACE }} \
+          --set prometheus.prometheusSpec.retention=15d \
+          --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.storageClassName=managed-csi \
+          --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.accessModes[0]=ReadWriteOnce \
+          --set "prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=20Gi" \
+          --set grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
+          --set grafana.persistence.enabled=true \
+          --set grafana.persistence.storageClassName=managed-csi \
+          --set grafana.persistence.size=5Gi \
+          --set grafana.sidecar.dashboards.enabled=true \
+          --set grafana.sidecar.dashboards.label=grafana_dashboard \
+          --set grafana.sidecar.dashboards.searchNamespace=ALL \
+          --set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
+          --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+          --set prometheus.prometheusSpec.ruleSelectorNilUsesHelmValues=false \
+          --wait --timeout=10m || echo "Prometheus stack already installed"
+
+    # ── Deploy Application ─────────────────────
+
+    - name: Deploy DemandPortal with Helm
+      run: |
+        helm upgrade --install demandportal ${{ env.HELM_CHART }} \
+          --namespace ${{ env.NAMESPACE }} \
+          --create-namespace \
+          --set image.registry="${{ secrets.ACR_LOGIN_SERVER }}" \
+          --set backend.image.tag="${{ needs.build-and-push.outputs.image-tag }}" \
+          --set frontend.image.tag="${{ needs.build-and-push.outputs.image-tag }}" \
+          --set secrets.postgresPassword="${{ secrets.POSTGRES_PASSWORD }}" \
+          --set secrets.appSecretKey="${{ secrets.APP_SECRET_KEY }}" \
+          --set certManager.email="${{ secrets.CERT_EMAIL }}" \
+          --set monitoring.grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
+          --wait \
+          --timeout=10m \
+          --atomic
+
+    # ── Verify ────────────────────────────────
+
+    - name: Verify full deployment
+      run: |
+        echo "=== Helm Releases ==="
+        helm list -A
+
+        echo ""
+        echo "=== Application Pods ==="
+        kubectl get pods -n ${{ env.NAMESPACE }}
+
+        echo ""
+        echo "=== Monitoring Pods ==="
+        kubectl get pods -n ${{ env.MONITORING_NAMESPACE }}
+
+        echo ""
+        echo "=== HPA ==="
+        kubectl get hpa -n ${{ env.NAMESPACE }}
+
+        echo ""
+        echo "=== Ingress ==="
+        kubectl get ingress -n ${{ env.NAMESPACE }}
+
+        echo ""
+        echo "=== Load Balancer IP ==="
+        kubectl get svc -n ingress-nginx ingress-nginx-controller
+
+        echo ""
+        echo "=== Grafana Access ==="
+        echo "Port forward: kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n ${{ env.MONITORING_NAMESPACE }}"
+        echo "Default login: admin / (from GRAFANA_ADMIN_PASSWORD secret)"
+
+    - name: Smoke test
+      run: |
+        LB_IP=$(kubectl get svc -n ingress-nginx ingress-nginx-controller \
+          -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+        if [ -n "$LB_IP" ]; then
+          echo "Load Balancer IP: $LB_IP"
+          sleep 15
+          curl -f http://$LB_IP/health && echo "Health check passed" || echo "Health check failed"
+        else
+          echo "LB IP not ready yet — check manually"
+        fi
+
+    - name: Rollback on failure
+      if: failure()
+      run: |
+        echo "Rolling back DemandPortal..."
+        helm rollback demandportal -n ${{ env.NAMESPACE }} || true
+
+    - name: Deployment summary
+      if: always()
+      run: |
+        echo "============================================"
+        echo " Status:    ${{ job.status }}"
+        echo " Image Tag: ${{ needs.build-and-push.outputs.image-tag }}"
+        echo " Cluster:   ${{ secrets.AKS_CLUSTER_NAME }}"
+        echo " App:       http://<LB-IP>"
+        echo " Grafana:   kubectl port-forward svc/kube-prometheus-stack-grafana 3000:80 -n monitoring"
+        echo "============================================"

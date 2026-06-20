@@ -1,0 +1,12 @@
+# Copy to terraform.tfvars
+# cp terraform.tfvars.example terraform.tfvars
+
+project_name       = "demandportal"
+location           = "eastus"
+environment        = "production"
+kubernetes_version = "1.29"
+app_node_vm_size   = "Standard_D4s_v3"
+app_node_count     = 2
+
+# Your GitHub repo - format: owner/repo-name
+github_repo = "YOUR_GITHUB_USERNAME/demandportal-aks"
