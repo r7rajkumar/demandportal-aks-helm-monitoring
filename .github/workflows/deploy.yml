@@ -286,11 +286,16 @@ jobs:
 
     # ── Deploy Application ─────────────────────
 
+
+
+    - name: Ensure namespace exists
+      run: |
+        kubectl get namespace ${{ env.NAMESPACE }} || kubectl create namespace ${{ env.NAMESPACE }}
+
     - name: Deploy DemandPortal with Helm
       run: |
         helm upgrade --install demandportal ${{ env.HELM_CHART }} \
           --namespace ${{ env.NAMESPACE }} \
-          --create-namespace \
           --set image.registry="${{ secrets.ACR_LOGIN_SERVER }}" \
           --set backend.image.tag="${{ needs.build-and-push.outputs.image-tag }}" \
           --set frontend.image.tag="${{ needs.build-and-push.outputs.image-tag }}" \
@@ -299,7 +304,9 @@ jobs:
           --set certManager.email="${{ secrets.CERT_EMAIL }}" \
           --set monitoring.grafana.adminPassword="${{ secrets.GRAFANA_ADMIN_PASSWORD }}" \
           --wait \
-          --timeout=10m 
+          --timeout=10m
+
+
 
           
     # ── Verify ────────────────────────────────
